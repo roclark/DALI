@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function
 from nvidia.dali.pipeline import Pipeline
 import nvidia.dali.ops as ops
 import nvidia.dali.types as types
@@ -21,10 +20,11 @@ import os
 import glob
 import argparse
 import time
+from test_utils import get_dali_extra_path
 
 class CommonPipeline(Pipeline):
     def __init__(self, data_paths, num_gpus, batch_size, num_threads, device_id, prefetch, fp16, random_shuffle, nhwc,
-                 decoder_type, decoder_cache_params, reader_queue_depth):
+                 dont_use_mmap, decoder_type, decoder_cache_params, reader_queue_depth, shard_id):
         super(CommonPipeline, self).__init__(batch_size, num_threads, device_id, random_shuffle, prefetch_queue_depth=prefetch)
         if decoder_type == 'roi':
             print('Using nvJPEG with ROI decoding')
@@ -60,7 +60,6 @@ class CommonPipeline(Pipeline):
                                             output_dtype=out_type,
                                             output_layout=layout,
                                             crop=(224, 224),
-                                            image_type=types.RGB,
                                             mean=[0.485 * 255,0.456 * 255,0.406 * 255],
                                             std=[0.229 * 255,0.224 * 255,0.225 * 255])
         self.coin = ops.CoinFlip(probability=0.5)
@@ -78,7 +77,7 @@ class MXNetReaderPipeline(CommonPipeline):
         cache_enabled = kwargs['decoder_cache_params']['cache_enabled']
         self.input = ops.MXNetReader(path = kwargs['data_paths'][0],
                                      index_path = kwargs['data_paths'][1],
-                                     shard_id = kwargs['device_id'],
+                                     shard_id = kwargs['shard_id'],
                                      num_shards = kwargs['num_gpus'],
                                      random_shuffle = kwargs['random_shuffle'],
                                      stick_to_shard = cache_enabled,
@@ -94,10 +93,11 @@ class CaffeReadPipeline(CommonPipeline):
         super(CaffeReadPipeline, self).__init__(**kwargs)
         cache_enabled = kwargs['decoder_cache_params']['cache_enabled']
         self.input = ops.CaffeReader(path = kwargs['data_paths'][0],
-                                     shard_id = kwargs['device_id'],
+                                     shard_id = kwargs['shard_id'],
                                      num_shards = kwargs['num_gpus'],
                                      stick_to_shard = cache_enabled,
                                      random_shuffle = kwargs['random_shuffle'],
+                                     dont_use_mmap = kwargs['dont_use_mmap'],
                                      #skip_cached_images = cache_enabled,
                                      prefetch_queue_depth = kwargs['reader_queue_depth'])
 
@@ -110,9 +110,10 @@ class Caffe2ReadPipeline(CommonPipeline):
         super(Caffe2ReadPipeline, self).__init__(**kwargs)
         cache_enabled = kwargs['decoder_cache_params']['cache_enabled']
         self.input = ops.Caffe2Reader(path = kwargs['data_paths'][0],
-                                      shard_id = kwargs['device_id'],
+                                      shard_id = kwargs['shard_id'],
                                       num_shards = kwargs['num_gpus'],
                                       random_shuffle = kwargs['random_shuffle'],
+                                      dont_use_mmap = kwargs['dont_use_mmap'],
                                       stick_to_shard = cache_enabled,
                                       #skip_cached_images = cache_enabled,
                                       prefetch_queue_depth = kwargs['reader_queue_depth'])
@@ -126,7 +127,7 @@ class FileReadPipeline(CommonPipeline):
         super(FileReadPipeline, self).__init__(**kwargs)
         cache_enabled = kwargs['decoder_cache_params']['cache_enabled']
         self.input = ops.FileReader(file_root = kwargs['data_paths'][0],
-                                    shard_id = kwargs['device_id'],
+                                    shard_id = kwargs['shard_id'],
                                     num_shards = kwargs['num_gpus'],
                                     random_shuffle = kwargs['random_shuffle'],
                                     stick_to_shard = cache_enabled,
@@ -145,7 +146,7 @@ class TFRecordPipeline(CommonPipeline):
         cache_enabled = kwargs['decoder_cache_params']['cache_enabled']
         self.input = ops.TFRecordReader(path = tfrecord,
                                         index_path = tfrecord_idx,
-                                        shard_id = kwargs['device_id'],
+                                        shard_id = kwargs['shard_id'],
                                         num_shards = kwargs['num_gpus'],
                                         random_shuffle = kwargs['random_shuffle'],
                                         stick_to_shard = cache_enabled,
@@ -172,11 +173,21 @@ test_data = {
             TFRecordPipeline: [["/data/imagenet/train-val-tfrecord-480/train-*", "/data/imagenet/train-val-tfrecord-480.idx/train-*"]],
             }
 
+data_root = get_dali_extra_path()
+
+small_test_data = {
+            FileReadPipeline: [[os.path.join(data_root, "db/single/jpeg/")]],
+            MXNetReaderPipeline: [[os.path.join(data_root, "db/recordio/train.rec"), os.path.join(data_root, "db/recordio/train.idx")]],
+            CaffeReadPipeline: [[os.path.join(data_root, "db/lmdb")]],
+            Caffe2ReadPipeline: [[os.path.join(data_root, "db/c2lmdb")]],
+            TFRecordPipeline: [[os.path.join(data_root, "db/tfrecord/train"), os.path.join(data_root, "db/tfrecord/train.idx")]]
+            }
+
 parser = argparse.ArgumentParser(description='Test nvJPEG based RN50 augmentation pipeline with different datasets')
 parser.add_argument('-g', '--gpus', default=1, type=int, metavar='N',
                     help='number of GPUs (default: 1)')
-parser.add_argument('-b', '--batch', default=2048, type=int, metavar='N',
-                    help='batch size (default: 2048)')
+parser.add_argument('-b', '--batch', default=1024, type=int, metavar='N',
+                    help='batch size (default: 1024)')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('-j', '--workers', default=3, type=int, metavar='N',
@@ -209,6 +220,14 @@ parser.add_argument('--reader_queue_depth', default=1, type=int, metavar='N',
                     help='prefetch queue depth (default: 1)')
 parser.add_argument('--read_shuffle', action='store_true',
                     help='Shuffle data when reading')
+parser.add_argument('--disable_mmap', action='store_true',
+                    help='Disable mmap for DALI readers. Used for network filesystem tests.')
+parser.add_argument('-s', '--small', action='store_true',
+                    help='use small dataset, DALI_EXTRA_PATH needs to be set')
+parser.add_argument('--assign_gpu', default=None, type=int, metavar='N',
+                    help='Assign a given GPU, cannot be used with --gpus')
+parser.add_argument('--assign_shard', default=None, type=int, metavar='N',
+                    help='Assign a given shard id, cannot be used with --gpus')
 parser.add_argument('--simulate_N_gpus', default=None, type=int, metavar='N',
                     help='Used to simulate small shard as it would be in a multi gpu setup with this number of gpus. If provided, each gpu will see a shard size as if we were in a multi gpu setup with this number of gpus')
 parser.add_argument('--remove_default_pipeline_paths', action='store_true',
@@ -226,6 +245,8 @@ parser.add_argument('--tfrecord_pipeline_paths', default=None, type=str, metavar
 args = parser.parse_args()
 
 N = args.gpus             # number of GPUs
+GPU_ID = args.assign_gpu
+DALI_SHARD = args.assign_shard
 BATCH_SIZE = args.batch   # batch size
 LOG_INTERVAL = args.print_freq
 WORKERS = args.workers
@@ -284,8 +305,14 @@ SKIP_CACHED_IMAGES = True if CACHED_DECODING else False
 
 READ_SHUFFLE=args.read_shuffle
 
-print("GPUs: {}, batch: {}, workers: {}, prefetch depth: {}, loging interval: {}, fp16: {}, NHWC: {}, READ_SHUFFLE: {}"
-      .format(N, BATCH_SIZE, WORKERS, PREFETCH, LOG_INTERVAL, FP16, NHWC, READ_SHUFFLE))
+DISABLE_MMAP=args.disable_mmap
+
+SMALL_DATA_SET = args.small
+if SMALL_DATA_SET:
+    test_data = small_test_data
+
+print("GPUs: {}, batch: {}, workers: {}, prefetch depth: {}, loging interval: {}, fp16: {}, NHWC: {}, READ_SHUFFLE: {}, DISABLE_MMAP: {}, small dataset: {}, GPU_ID: {}, DALI_SHARD: {}"
+      .format(N, BATCH_SIZE, WORKERS, PREFETCH, LOG_INTERVAL, FP16, NHWC, READ_SHUFFLE, DISABLE_MMAP, SMALL_DATA_SET, GPU_ID, DALI_SHARD))
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -310,10 +337,16 @@ class AverageMeter(object):
 for pipe_name in test_data.keys():
     data_set_len = len(test_data[pipe_name])
     for i, data_set in enumerate(test_data[pipe_name]):
-        pipes = [pipe_name(batch_size=BATCH_SIZE, num_threads=WORKERS, device_id=n,
-                           num_gpus=SIMULATE_N_GPUS, data_paths=data_set, prefetch=PREFETCH, fp16=FP16, random_shuffle=READ_SHUFFLE,
-                           nhwc=NHWC, decoder_type=DECODER_TYPE, decoder_cache_params=DECODER_CACHE_PARAMS,
-                           reader_queue_depth=READER_QUEUE_DEPTH) for n in range(N)]
+        if GPU_ID is None:
+            pipes = [pipe_name(batch_size=BATCH_SIZE, num_threads=WORKERS, device_id=n,
+                            num_gpus=SIMULATE_N_GPUS, data_paths=data_set, prefetch=PREFETCH, fp16=FP16, random_shuffle=READ_SHUFFLE,
+                            dont_use_mmap=DISABLE_MMAP, nhwc=NHWC, decoder_type=DECODER_TYPE, decoder_cache_params=DECODER_CACHE_PARAMS,
+                            reader_queue_depth=READER_QUEUE_DEPTH, shard_id=n) for n in range(N)]
+        else:
+            pipes = [pipe_name(batch_size=BATCH_SIZE, num_threads=WORKERS, device_id=GPU_ID,
+                              num_gpus=SIMULATE_N_GPUS, data_paths=data_set, prefetch=PREFETCH, fp16=FP16, random_shuffle=READ_SHUFFLE,
+                              dont_use_mmap=DISABLE_MMAP, nhwc=NHWC, decoder_type=DECODER_TYPE, decoder_cache_params=DECODER_CACHE_PARAMS,
+                              reader_queue_depth=READER_QUEUE_DEPTH, shard_id=DALI_SHARD)]
         [pipe.build() for pipe in pipes]
 
         if args.iters < 0:
@@ -346,7 +379,7 @@ for pipe_name in test_data.keys():
               data_time.update(time.time() - end)
               if j % LOG_INTERVAL == 0:
                   print("{} {}/ {}, avg time: {} [s], worst time: {} [s], speed: {} [img/s]"
-                  .format(pipe_name.__name__, j + 1, iters, data_time.avg, data_time.max_val, N * BATCH_SIZE / data_time.avg))
+                  .format(pipe_name.__name__, j + 1, iters, data_time.avg, data_time.max_val, SIMULATE_N_GPUS * BATCH_SIZE / data_time.avg))
               end = time.time()
 
         print("OK {0}/{1}: {2}".format(i + 1, data_set_len, pipe_name.__name__))
